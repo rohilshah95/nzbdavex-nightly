@@ -45,8 +45,7 @@ jobs:
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v7
         with:
-          context: .
-          file: ./Dockerfile
+          context: https://github.com/qooode/nzbdavex.git#main
           push: true
           # NEW LINE: Explicitly tells the builder to output BOTH x86 and ARM64 layers
           platforms: linux/amd64,linux/arm64
