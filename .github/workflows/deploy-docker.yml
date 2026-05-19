@@ -1,0 +1,166 @@
+name: Build and Deploy Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git Ref (Tag or Branch)
+        required: true
+        type: string
+
+jobs:
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tags: ${{ steps.tags.outputs.tags }}
+      channel: ${{ steps.tags.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref }}
+
+      - name: Calculate tags
+        id: tags
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          declare TAGS=""
+          # Clean inputs to evaluate cleanly
+          CLEAN_REF=$(echo "${INPUT_REF}" | sed 's/refs\/tags\///')
+          
+          case "${CLEAN_REF}" in
+          v[0-9]*.[0-9]*.[0-9]*)
+            TAGS="${CLEAN_REF}"
+            if [[ "$(git rev-parse origin/main)" = "$(git rev-parse "${CLEAN_REF}")" ]]; then
+              MAJOR_MINOR=$(echo "${CLEAN_REF}" | sed -E 's/v([0-9]+)\.([0-9]+)\.[0-9]+/\1.\2/')
+              MAJOR=$(echo "${CLEAN_REF}" | sed -E 's/v([0-9]+)\.[0-9]+\.[0-9]+/\1/')
+              TAGS="${TAGS} latest v${MAJOR_MINOR} v${MAJOR}"
+            fi
+            CHANNEL="stable"
+            ;;
+          [0-9]*.[0-9]*.[0-9]*-nightly|[0-9]*.[0-9]*-nightly)
+            # Catching your custom nightly tag structure cleanly
+            TAGS="${CLEAN_REF} nightly"
+            CHANNEL="nightly"
+            ;;
+          *)
+            echo "Invalid Input Ref: ${CLEAN_REF}"
+            exit 1
+            ;;
+          esac
+
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "channel=${CHANNEL}" >> $GITHUB_OUTPUT
+
+  build:
+    name: build (${{ matrix.suffix }})
+    needs: setup
+    permissions:
+      packages: write
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            # Using native ARM infrastructure available on modern GitHub Actions runners
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and Push Architecture Layer
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          platforms: ${{ matrix.platform }}
+          push: true
+          context: .
+          file: ./Dockerfile
+          # CRITICAL: We tag the raw images by their SHA digest suffix so they don't overwrite public production tags early
+          tags: ghcr.io/${{ github.repository_owner }}/nzbdavex:${{ inputs.ref }}-${{ matrix.suffix }}
+          cache-from: type=gha,scope=${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.suffix }}
+          build-args: |
+            REPO_URL=https://github.com/${{ github.repository }}
+            NZBDAV_VERSION=${{ inputs.ref }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > /tmp/digests/${{ matrix.suffix }}
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.suffix }}
+          path: /tmp/digests/${{ matrix.suffix }}
+          retention-days: 1
+
+  merge:
+    name: Merge manifests
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Download AMD64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digests-amd64
+          path: /tmp/digests
+
+      - name: Download ARM64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digests-arm64
+          path: /tmp/digests
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create and push manifests
+        env:
+          TAGS: ${{ needs.setup.outputs.tags }}
+        run: |
+          # Fetch the raw layer digests saved by our matrix jobs
+          AMD64_DIGEST=$(cat /tmp/digests/amd64)
+          ARM64_DIGEST=$(cat /tmp/digests/arm64)
+          
+          # Loop over every computed tag name and attach the multi-arch parent manifest map
+          for tag in ${TAGS}; do
+            docker buildx imagetools create \
+              -t "ghcr.io/${{ github.repository_owner }}/nzbdavex:${tag}" \
+              "ghcr.io/${{ github.repository_owner }}/nzbdavex@${AMD64_DIGEST}" \
+              "ghcr.io/${{ github.repository_owner }}/nzbdavex@${ARM64_DIGEST}"
+          done

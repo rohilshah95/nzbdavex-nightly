@@ -1,55 +1,122 @@
-name: Build Nightly Image
+name: Nightly Builds
 
 on:
-  schedule:
-    - cron: '0 0 * * *' # Runs every night at midnight UTC
-  workflow_dispatch: # Adds the manual run button
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/nzbdavex
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'Dockerfile'
+      - 'entrypoint.sh'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
 
 jobs:
-  build-nightly:
+  release:
+    name: Release
+    if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
-
+      actions: write
+      contents: write
+      pull-requests: write
     steps:
-      - name: Checkout Upstream Repository
+      - name: Checkout code
         uses: actions/checkout@v5
-
-      # NEW STEP: Sets up hardware emulation so the Intel cloud server can build ARM64 binaries
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Generate timestamp tag
+        id: gen_tag
+        run: |
+          # Changed format from 4 blocks to standard 3-block layout so deploy-docker accepts it
+          TIMESTAMP=$(date '+%Y.%m.%d')-nightly
+          echo "tag_name=$TIMESTAMP" >> $GITHUB_OUTPUT
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=nightly
+      - name: Get last nightly tag
+        id: get_last_nightly_tag
+        run: |
+          LAST_NIGHTLY_TAG=$(git tag -l "*-nightly" --sort=-committerdate | head -n 1 || echo "")
+          echo "last_nightly_tag=$LAST_NIGHTLY_TAG" >> $GITHUB_OUTPUT
+          echo "Found last nightly tag: ${LAST_NIGHTLY_TAG:-none}"
 
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v7
-        with:
-          context: https://github.com/qooode/nzbdavex.git#main
-          push: true
-          # NEW LINE: Explicitly tells the builder to output BOTH x86 and ARM64 layers
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Get commit messages
+        id: commit_msgs
+        run: |
+          expand_commits() {
+            local range="$1"
+            local result=""
+            local hashes
+            mapfile -t hashes < <(git log "$range" --pretty=format:"%H")
+
+            for hash in "${hashes[@]}"; do
+              subject=$(git log -1 --pretty=format:"%s" "$hash")
+              body=$(git log -1 --pretty=format:"%b" "$hash")
+              short_hash="${hash:0:7}"
+
+              cc_lines=$(echo "$body" | grep -E '^(feat|fix|docs|style|refactor|test|chore|ci|build|perf|revert)(\([^)]+\))?!?: .+' || true)
+
+              if [ -n "$cc_lines" ]; then
+                while IFS= read -r cc_line; do
+                  result="${result}* ${cc_line}"$'\n'
+                done <<< "$cc_lines"
+              else
+                result="${result}* ${subject} (${short_hash})"$'\n'
+              fi
+            done
+
+            printf "%s" "$result"
+          }
+
+          if [ -z "${{ steps.get_last_nightly_tag.outputs.last_nightly_tag }}" ]; then
+            echo "No previous nightly tag found. Getting recent commits."
+            COMMIT_MSGS=$(expand_commits "-n 20")
+          else
+            echo "Getting commits since ${{ steps.get_last_nightly_tag.outputs.last_nightly_tag }}"
+            COMMIT_MSGS=$(expand_commits "${{ steps.get_last_nightly_tag.outputs.last_nightly_tag }}..HEAD")
+          fi
+
+          if [ -z "$COMMIT_MSGS" ]; then
+            COMMIT_MSGS="No new commits since last nightly build"
+          fi
+
+          echo "commit_msgs<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMIT_MSGS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create git tag
+        env:
+          TAG_NAME: ${{ steps.gen_tag.outputs.tag_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Delete tag if it already exists locally/remotely for today's run
+          git tag -d $TAG_NAME || true
+          git tag $TAG_NAME
+          git push origin $TAG_NAME --force
+
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.gen_tag.outputs.tag_name }}
+          COMMIT_MSGS: ${{ steps.commit_msgs.outputs.commit_msgs }}
+        run: |
+          RELEASE_NOTES=$(cat <<EOF
+          ## $TAG_NAME
+          $COMMIT_MSGS
+          EOF
+          )
+          # Use clobber parameter to overwrite if multiple runs trigger in one day
+          gh release create "$TAG_NAME" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Nightly Build - $TAG_NAME" \
+            --notes "$RELEASE_NOTES" \
+            --prerelease \
+            --clobber
+
+      - name: Trigger Docker Image Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run --repo ${GITHUB_REPOSITORY} deploy-docker.yml -f ref=${{ steps.gen_tag.outputs.tag_name }}
