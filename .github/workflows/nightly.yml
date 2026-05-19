@@ -107,13 +107,16 @@ jobs:
           $COMMIT_MSGS
           EOF
           )
-          # Use clobber parameter to overwrite if multiple runs trigger in one day
+          
+          # If a release for today's tag already exists, delete it first to prevent conflicts
+          gh release delete "$TAG_NAME" --yes --repo "${GITHUB_REPOSITORY}" || true
+
+          # Create the fresh prerelease without using the --clobber flag
           gh release create "$TAG_NAME" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "Nightly Build - $TAG_NAME" \
             --notes "$RELEASE_NOTES" \
-            --prerelease \
-            --clobber
+            --prerelease
 
       - name: Trigger Docker Image Publish
         env:
